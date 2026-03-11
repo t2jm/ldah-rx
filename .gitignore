@@ -1,0 +1,10 @@
+.direnv
+
+# ESP-IDF build output
+build/
+
+# ESP-IDF generated config (sdkconfig is usually committed, but these are not)
+sdkconfig.old
+
+# Dependencies managed by idf component manager
+managed_components/
