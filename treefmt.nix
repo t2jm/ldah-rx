@@ -11,5 +11,6 @@
       ];
       settings.proseWrap = "always";
     };
+    taplo.enable = true;
   };
 }
