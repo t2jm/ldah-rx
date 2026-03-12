@@ -5,6 +5,7 @@
  */
 
 #include "driver/i2c_master.h"
+#include "driver/uart.h"
 #include "esp_err.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
@@ -13,6 +14,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
+#include <inttypes.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <sys/lock.h>
 #include <sys/param.h>
@@ -24,7 +27,7 @@
 #include "esp_lcd_panel_vendor.h"
 #endif
 
-static const char *TAG = "example";
+static const char *TAG = "ldah-rx";
 
 #define I2C_BUS_PORT 0
 
@@ -63,7 +66,40 @@ static uint8_t oled_buffer[EXAMPLE_LCD_H_RES * EXAMPLE_LCD_V_RES / 8];
 // different tasks, so use a mutex to protect it
 static _lock_t lvgl_api_lock;
 
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////// UART2 payload receiver (from NUCLEO-L432KC)
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#define LDAH_UART_PORT UART_NUM_2
+#define LDAH_UART_BAUD 115200
+#define LDAH_UART_TXD_PIN 17
+#define LDAH_UART_RXD_PIN 16
+#define LDAH_UART_BUF_SIZE 256
+
+/*
+ * Payload bit layout (32-bit unsigned integer, little-endian byte order):
+ *
+ *   MSB
+ *   [31:28] sync nibble (4 bits, always 0xA)
+ *   [27:20] heart rate  (8 bits, BPM)
+ *   [19:13] SpO2        (7 bits, %)
+ *   [12: 4] GSR         (9 bits, uS)
+ *   [    3] pulse       (1 bit, unit impulse train)
+ *   [    2] contact     (1 bit, 1=finger detected)
+ *   [ 1: 0] lie eval    (2 bits: 00=undef, 01=lie, 10=truth, 11=inconclusive)
+ *   LSB
+ */
+#define PAYLOAD_SYNC 0xA
+#define PAYLOAD_HR(p) (((p) >> 20) & 0xFF)
+#define PAYLOAD_SPO2(p) (((p) >> 13) & 0x7F)
+#define PAYLOAD_GSR(p) (((p) >> 4) & 0x1FF)
+#define PAYLOAD_PULSE(p) (((p) >> 3) & 0x01)
+#define PAYLOAD_CONTACT(p) (((p) >> 2) & 0x01)
+#define PAYLOAD_LIE(p) (((p) >> 0) & 0x03)
+
 extern void example_lvgl_demo_ui(lv_disp_t *disp);
+extern void ldah_ui_update(uint8_t hr, uint8_t spo2, uint16_t gsr, bool pulse,
+                           bool contact, uint8_t lie_eval);
 
 static bool
 example_notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t io_panel,
@@ -135,6 +171,71 @@ static void example_lvgl_port_task(void *arg) {
   }
 }
 
+static void ldah_uart_init(void) {
+  const uart_config_t cfg = {
+      .baud_rate = LDAH_UART_BAUD,
+      .data_bits = UART_DATA_8_BITS,
+      .parity = UART_PARITY_DISABLE,
+      .stop_bits = UART_STOP_BITS_1,
+      .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+      .source_clk = UART_SCLK_DEFAULT,
+  };
+  ESP_ERROR_CHECK(uart_param_config(LDAH_UART_PORT, &cfg));
+  ESP_ERROR_CHECK(uart_set_pin(LDAH_UART_PORT, LDAH_UART_TXD_PIN,
+                               LDAH_UART_RXD_PIN, UART_PIN_NO_CHANGE,
+                               UART_PIN_NO_CHANGE));
+  ESP_ERROR_CHECK(
+      uart_driver_install(LDAH_UART_PORT, LDAH_UART_BUF_SIZE, 0, 0, NULL, 0));
+}
+
+static void ldah_uart_task(void *arg) {
+  static const char *const lie_strs[] = {"  UNDEF", "    LIE", "  TRUTH",
+                                         "INCONCL"};
+  uint8_t win[4] = {0};
+  int pos = 0;
+
+  uart_flush(LDAH_UART_PORT);
+
+  while (1) {
+    uint8_t byte;
+    int n = uart_read_bytes(LDAH_UART_PORT, &byte, 1, pdMS_TO_TICKS(2000));
+    if (n != 1)
+      continue;
+
+    win[pos++] = byte;
+    if (pos < 4)
+      continue;
+
+    // Reconstruct little-endian uint32 (NUCLEO ARM is LE-native)
+    uint32_t p = (uint32_t)win[0] | ((uint32_t)win[1] << 8) |
+                 ((uint32_t)win[2] << 16) | ((uint32_t)win[3] << 24);
+
+    // Validate: sync nibble [31:28] must be 0xA
+    if ((p >> 28) != PAYLOAD_SYNC) {
+      // Misaligned - slide window by 1 byte to resync
+      win[0] = win[1];
+      win[1] = win[2];
+      win[2] = win[3];
+      pos = 3;
+      continue;
+    }
+
+    // Valid frame - reset window for next frame
+    pos = 0;
+
+    ESP_LOGI(TAG,
+             "RX payload: 0x%08" PRIx32
+             " | HR=%3u SPO2=%3u GSR=%3u Pulse=%u Contact=%u Lie=%s",
+             p, PAYLOAD_HR(p), PAYLOAD_SPO2(p), PAYLOAD_GSR(p),
+             PAYLOAD_PULSE(p), PAYLOAD_CONTACT(p), lie_strs[PAYLOAD_LIE(p)]);
+
+    _lock_acquire(&lvgl_api_lock);
+    ldah_ui_update(PAYLOAD_HR(p), PAYLOAD_SPO2(p), PAYLOAD_GSR(p),
+                   PAYLOAD_PULSE(p), PAYLOAD_CONTACT(p), PAYLOAD_LIE(p));
+    _lock_release(&lvgl_api_lock);
+  }
+}
+
 void app_main(void) {
   ESP_LOGI(TAG, "Initialize I2C bus");
   i2c_master_bus_handle_t i2c_bus = NULL;
@@ -188,6 +289,7 @@ void app_main(void) {
 
   ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
   ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+  ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, true));
   ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
 
 #if CONFIG_EXAMPLE_LCD_CONTROLLER_SH1107
@@ -242,7 +344,11 @@ void app_main(void) {
   xTaskCreate(example_lvgl_port_task, "LVGL", EXAMPLE_LVGL_TASK_STACK_SIZE,
               NULL, EXAMPLE_LVGL_TASK_PRIORITY, NULL);
 
-  ESP_LOGI(TAG, "Display LVGL Scroll Text");
+  ESP_LOGI(TAG, "Initialize UART2 (LDAH payload receiver)");
+  ldah_uart_init();
+  xTaskCreate(ldah_uart_task, "ldah_uart", 4096, NULL, 3, NULL);
+
+  ESP_LOGI(TAG, "Display lie detector UI");
   // Lock the mutex due to the LVGL APIs are not thread-safe
   _lock_acquire(&lvgl_api_lock);
   example_lvgl_demo_ui(display);
