@@ -8,3 +8,6 @@ sdkconfig.old
 
 # Dependencies managed by idf component manager
 managed_components/
+
+# clangd cache
+.cache/clangd/index/
